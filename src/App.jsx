@@ -23,6 +23,7 @@ const MONTHS = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto
 const MONTHS_SHORT = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
 const fmt = (n) => new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 }).format(n || 0)
 const getCat = (id) => CATEGORIES.find(c => c.id === id) || CATEGORIES[8]
+const monthKey = (m, y) => `${y}-${String(m + 1).padStart(2, "0")}`
 
 // ─── SMALL COMPONENTS ─────────────────────────────────────────────────────────
 function Spinner() {
@@ -120,6 +121,13 @@ export default function App() {
   const [compareExpenses, setCompareExpenses] = useState([])
   const [menuOpen, setMenuOpen] = useState(false)
 
+  // ── Budgets state ──────────────────────────────────────────────────────────
+  const [budgets, setBudgets] = useState(DEFAULT_BUDGETS)
+  const [editBudgets, setEditBudgets] = useState(DEFAULT_BUDGETS)
+  const [budgetsDirty, setBudgetsDirty] = useState(false)
+  const [savingBudgets, setSavingBudgets] = useState(false)
+
+  // ── Fetch expenses ─────────────────────────────────────────────────────────
   const fetchExpenses = useCallback(async () => {
     setLoading(true)
     const firstDay = new Date(selectedYear, selectedMonth, 1).toISOString()
@@ -127,7 +135,7 @@ export default function App() {
     const { data, error } = await supabase.from("expenses").select("*")
       .gte("expense_date", firstDay).lte("expense_date", lastDay)
       .order("expense_date", { ascending: false })
-    if (error) showToast("Error al cargar: " + error.message, "error")
+    if (error) showToast("Error al cargar gastos: " + error.message, "error")
     else setExpenses(data || [])
     setLoading(false)
   }, [selectedMonth, selectedYear])
@@ -142,6 +150,57 @@ export default function App() {
     return () => supabase.removeChannel(channel)
   }, [fetchExpenses])
 
+  // ── Fetch budgets from Supabase ────────────────────────────────────────────
+  const fetchBudgets = useCallback(async () => {
+    const key = monthKey(selectedMonth, selectedYear)
+    const { data } = await supabase.from("budgets").select("*").eq("month", key)
+    if (data && data.length > 0) {
+      const b = {}
+      data.forEach(r => { b[r.category] = Number(r.amount) })
+      // Fill missing categories with defaults
+      CATEGORIES.forEach(c => { if (!b[c.id]) b[c.id] = DEFAULT_BUDGETS[c.id] })
+      setBudgets(b)
+      setEditBudgets(b)
+    } else {
+      // No budgets for this month — try copying from previous month
+      const prevMonth = selectedMonth === 0 ? 11 : selectedMonth - 1
+      const prevYear  = selectedMonth === 0 ? selectedYear - 1 : selectedYear
+      const prevKey   = monthKey(prevMonth, prevYear)
+      const { data: prevData } = await supabase.from("budgets").select("*").eq("month", prevKey)
+      if (prevData && prevData.length > 0) {
+        const b = {}
+        prevData.forEach(r => { b[r.category] = Number(r.amount) })
+        CATEGORIES.forEach(c => { if (!b[c.id]) b[c.id] = DEFAULT_BUDGETS[c.id] })
+        setBudgets(b)
+        setEditBudgets(b)
+      } else {
+        setBudgets(DEFAULT_BUDGETS)
+        setEditBudgets(DEFAULT_BUDGETS)
+      }
+    }
+    setBudgetsDirty(false)
+  }, [selectedMonth, selectedYear])
+
+  useEffect(() => { fetchBudgets() }, [fetchBudgets])
+
+  // ── Save budgets to Supabase ───────────────────────────────────────────────
+  async function saveBudgets() {
+    setSavingBudgets(true)
+    const key = monthKey(selectedMonth, selectedYear)
+    const rows = CATEGORIES.map(c => ({
+      category: c.id,
+      amount:   editBudgets[c.id] || DEFAULT_BUDGETS[c.id],
+      month:    key,
+    }))
+    const { error } = await supabase.from("budgets").upsert(rows, { onConflict: "category,month" })
+    setSavingBudgets(false)
+    if (error) { showToast("Error al guardar presupuesto: " + error.message, "error"); return }
+    setBudgets(editBudgets)
+    setBudgetsDirty(false)
+    showToast(`Presupuesto de ${MONTHS[selectedMonth]} guardado ✓`)
+  }
+
+  // ── Compare month data ─────────────────────────────────────────────────────
   useEffect(() => {
     if (view !== "compare") return
     const firstDay = new Date(compareYear, compareMonth, 1).toISOString()
@@ -150,15 +209,17 @@ export default function App() {
       .then(({ data }) => setCompareExpenses(data || []))
   }, [view, compareMonth, compareYear])
 
+  // ── Derived data ───────────────────────────────────────────────────────────
   const filtered     = expenses.filter(e => filterCat === "all" || e.category === filterCat)
   const totalSpent   = expenses.reduce((s,e) => s + Number(e.amount), 0)
-  const totalBudget  = Object.values(DEFAULT_BUDGETS).reduce((s,v) => s+v, 0)
+  const totalBudget  = Object.values(budgets).reduce((s,v) => s+v, 0)
   const compareTotal = compareExpenses.reduce((s,e) => s + Number(e.amount), 0)
   const spentByCat   = Object.fromEntries(CATEGORIES.map(c => [c.id, expenses.filter(e=>e.category===c.id).reduce((s,e)=>s+Number(e.amount),0)]))
   const compareByCat = Object.fromEntries(CATEGORIES.map(c => [c.id, compareExpenses.filter(e=>e.category===c.id).reduce((s,e)=>s+Number(e.amount),0)]))
 
   function showToast(msg, type="success") { setToast({ msg, type }) }
 
+  // ── Add expense ────────────────────────────────────────────────────────────
   async function handleAdd() {
     if (!newExp.description || !newExp.amount) return
     setSaving(true)
@@ -178,6 +239,7 @@ export default function App() {
     setNewExp({ description:"", amount:"", category:"food", user_name:"", expense_date: now.toISOString().slice(0,10) })
   }
 
+  // ── Delete expense ─────────────────────────────────────────────────────────
   async function handleDelete(id) {
     const { error } = await supabase.from("expenses").delete().eq("id", id)
     if (error) { showToast("Error al eliminar", "error"); return }
@@ -206,7 +268,7 @@ export default function App() {
         @media (max-width: 640px) {
           .sidebar { display: none !important; }
           .mobile-header { display: flex !important; }
-          .main-content { padding: 16px 16px 64px !important; }
+          .main-content { padding: 72px 16px 64px !important; }
         }
       `}</style>
 
@@ -225,6 +287,14 @@ export default function App() {
       {menuOpen && (
         <div style={{ position:"fixed", inset:0, zIndex:99, background:"rgba(0,0,0,0.8)" }} onClick={() => setMenuOpen(false)}>
           <div style={{ position:"absolute", top:56, left:0, right:0, background:"#0b1520", padding:16, borderBottom:"1px solid rgba(255,255,255,0.06)" }} onClick={e => e.stopPropagation()}>
+            <div style={{ display:"flex", gap:6, marginBottom:12 }}>
+              <select value={selectedMonth} onChange={e => setSelectedMonth(Number(e.target.value))} style={{ ...S.select, flex:1, fontSize:12 }}>
+                {MONTHS.map((m,i) => <option key={i} value={i}>{m}</option>)}
+              </select>
+              <select value={selectedYear} onChange={e => setSelectedYear(Number(e.target.value))} style={{ ...S.select, width:80, fontSize:12 }}>
+                {[2024,2025,2026].map(y => <option key={y} value={y}>{y}</option>)}
+              </select>
+            </div>
             {navItems.map(item => (
               <button key={item.id} onClick={() => { setView(item.id); setMenuOpen(false) }} style={{ ...S.navBtn, ...(view===item.id ? S.navBtnActive : {}), width:"100%", marginBottom:4 }}>
                 <span>{item.icon}</span> {item.label}
@@ -273,18 +343,6 @@ export default function App() {
       <main style={S.main}>
         <div className="main-content" style={{ padding:"32px 32px 64px", maxWidth:860, animation:"fadeIn 0.25s ease" }}>
 
-          {/* PERÍODO SELECTOR MOBILE */}
-          <div style={{ display:"none" }} className="mobile-period">
-            <div style={{ display:"flex", gap:6, marginBottom:16 }}>
-              <select value={selectedMonth} onChange={e => setSelectedMonth(Number(e.target.value))} style={{ ...S.select, flex:1 }}>
-                {MONTHS.map((m,i) => <option key={i} value={i}>{m}</option>)}
-              </select>
-              <select value={selectedYear} onChange={e => setSelectedYear(Number(e.target.value))} style={{ ...S.select, width:80 }}>
-                {[2024,2025,2026].map(y => <option key={y} value={y}>{y}</option>)}
-              </select>
-            </div>
-          </div>
-
           {/* ── DASHBOARD ── */}
           {view === "dashboard" && (<>
             <div style={S.pageHeader}>
@@ -303,7 +361,7 @@ export default function App() {
               </div>
               <div style={{ fontSize:12, fontWeight:700, color:"#334155", textTransform:"uppercase", letterSpacing:1, margin:"28px 0 14px" }}>Por categoría</div>
               <div style={S.catGrid}>
-                {CATEGORIES.map(cat => <BudgetRing key={cat.id} cat={cat} spent={spentByCat[cat.id]} budget={DEFAULT_BUDGETS[cat.id]}/>)}
+                {CATEGORIES.map(cat => <BudgetRing key={cat.id} cat={cat} spent={spentByCat[cat.id]} budget={budgets[cat.id]}/>)}
               </div>
               <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", margin:"28px 0 14px" }}>
                 <div style={{ fontSize:12, fontWeight:700, color:"#334155", textTransform:"uppercase", letterSpacing:1 }}>Últimos movimientos</div>
@@ -347,13 +405,34 @@ export default function App() {
             <div style={S.pageHeader}>
               <div>
                 <h1 style={S.h1}>Presupuesto</h1>
-                <p style={{ color:"#475569", fontSize:13 }}>{MONTHS[selectedMonth]} {selectedYear}</p>
+                <p style={{ color:"#475569", fontSize:13 }}>
+                  {MONTHS[selectedMonth]} {selectedYear}
+                  {budgetsDirty && <span style={{ color:"#fb923c", marginLeft:8, fontSize:11 }}>● Sin guardar</span>}
+                </p>
+              </div>
+              <div style={{ display:"flex", gap:8 }}>
+                {budgetsDirty && (
+                  <button onClick={() => { setEditBudgets(budgets); setBudgetsDirty(false) }} style={{ ...S.btn, background:"rgba(255,255,255,0.05)", color:"#64748b" }}>
+                    Cancelar
+                  </button>
+                )}
+                <button onClick={saveBudgets} disabled={savingBudgets || !budgetsDirty} style={{ ...S.btn, opacity: budgetsDirty ? 1 : 0.4 }}>
+                  {savingBudgets ? "Guardando..." : "💾 Guardar presupuesto"}
+                </button>
               </div>
             </div>
+
+            {/* Info banner */}
+            <div style={{ background:"rgba(96,165,250,0.06)", border:"1px solid rgba(96,165,250,0.15)", borderRadius:10, padding:"10px 16px", marginBottom:20, fontSize:12, color:"#93c5fd", display:"flex", gap:10, alignItems:"center" }}>
+              <span>💡</span>
+              <span>Si no hay presupuesto guardado para este mes, se copia automáticamente el del mes anterior.</span>
+            </div>
+
+            {/* Summary bar */}
             <div style={{ ...S.kpiCard, marginBottom:24, display:"flex", gap:32, alignItems:"center", flexWrap:"wrap" }}>
               <div>
                 <div style={{ fontSize:11, color:"#64748b" }}>Presupuesto total</div>
-                <div style={{ fontSize:26, fontWeight:800, color:"#f1f5f9" }}>{fmt(totalBudget)}</div>
+                <div style={{ fontSize:26, fontWeight:800, color:"#f1f5f9" }}>{fmt(Object.values(editBudgets).reduce((s,v)=>s+v,0))}</div>
               </div>
               <div>
                 <div style={{ fontSize:11, color:"#64748b" }}>Ejecutado</div>
@@ -362,29 +441,43 @@ export default function App() {
               <div style={{ flex:1, minWidth:160 }}>
                 <div style={{ fontSize:11, color:"#64748b", marginBottom:6 }}>Avance general</div>
                 <div style={{ height:8, borderRadius:99, background:"rgba(255,255,255,0.06)" }}>
-                  <div style={{ height:"100%", borderRadius:99, width:`${Math.min(100,(totalSpent/totalBudget)*100)}%`, background:"linear-gradient(90deg,#60a5fa,#a78bfa)", transition:"width 0.6s" }}/>
+                  <div style={{ height:"100%", borderRadius:99, width:`${Math.min(100,(totalSpent/Object.values(editBudgets).reduce((s,v)=>s+v,1))*100)}%`, background:"linear-gradient(90deg,#60a5fa,#a78bfa)", transition:"width 0.6s" }}/>
                 </div>
               </div>
             </div>
+
             <div style={S.budgetGrid}>
               {CATEGORIES.map(cat => {
-                const spent = spentByCat[cat.id] || 0
-                const budget = DEFAULT_BUDGETS[cat.id]
-                const pct = Math.min((spent/budget)*100,100)
-                const over = spent > budget
+                const spent  = spentByCat[cat.id] || 0
+                const budget = editBudgets[cat.id] || DEFAULT_BUDGETS[cat.id]
+                const pct    = Math.min((spent/budget)*100, 100)
+                const over   = spent > budget
                 return (
-                  <div key={cat.id} style={S.kpiCard}>
+                  <div key={cat.id} style={{ ...S.kpiCard, borderColor: over ? "#f8717133" : "rgba(255,255,255,0.06)" }}>
                     <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10 }}>
                       <span style={{ fontSize:22 }}>{cat.icon}</span>
                       <div>
                         <div style={{ fontSize:13, fontWeight:600, color:"#e2e8f0" }}>{cat.label}</div>
-                        <div style={{ fontSize:11, color:"#64748b" }}>{fmt(spent)} / {fmt(budget)}</div>
+                        <div style={{ fontSize:11, color: over ? "#f87171" : "#64748b" }}>
+                          {fmt(spent)} gastado{over ? " ⚠️" : ""}
+                        </div>
                       </div>
                     </div>
-                    <div style={{ height:5, borderRadius:99, background:"rgba(255,255,255,0.06)" }}>
+                    <div style={{ height:5, borderRadius:99, background:"rgba(255,255,255,0.06)", marginBottom:10 }}>
                       <div style={{ height:"100%", borderRadius:99, width:`${pct}%`, background: over?"#f87171":cat.color, transition:"width 0.6s" }}/>
                     </div>
-                    {over && <div style={{ fontSize:11, color:"#f87171", marginTop:6 }}>⚠️ Superaste el presupuesto</div>}
+                    <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                      <span style={{ fontSize:12, color:"#475569", flexShrink:0 }}>Límite $</span>
+                      <input
+                        type="number"
+                        value={editBudgets[cat.id] || ""}
+                        onChange={e => {
+                          setEditBudgets(b => ({ ...b, [cat.id]: Number(e.target.value) }))
+                          setBudgetsDirty(true)
+                        }}
+                        style={{ ...S.input, flex:1, padding:"6px 10px", fontSize:13 }}
+                      />
+                    </div>
                   </div>
                 )
               })}
